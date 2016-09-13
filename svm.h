@@ -3,7 +3,7 @@
 
 #define LIBSVM_VERSION 321
 #define GPU true
-
+#define THREAD_PER_BLOCK 50
 #ifdef __cplusplus
 extern "C" {
 #endif

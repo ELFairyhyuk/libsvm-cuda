@@ -2473,7 +2473,7 @@ double svm_predict_probability(const svm_model *model, const svm_node *x,
 					cudaMemcpyHostToDevice);
 			cudaMemcpy(d_probB, model->probB, sizeof(double) * cnr2,
 					cudaMemcpyHostToDevice);
-			dim3 threadPerBlock(16, 16);
+			dim3 threadPerBlock(THREAD_PER_BLOCK, THREAD_PER_BLOCK);
 			dim3 numBlocks(nr_class / threadPerBlock.x + 1,
 					nr_class / threadPerBlock.x + 1);
 			kernel_sigmoid_predict<<<numBlocks, threadPerBlock>>>(d_dec_values,

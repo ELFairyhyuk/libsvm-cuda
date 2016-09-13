@@ -4,7 +4,7 @@
 #include <string.h>
 #include <errno.h>
 #include "svm.h"
-
+#include<time.h>
 int print_null(const char *s,...) {return 0;}
 
 static int (*info)(const char *fmt,...) = &printf;
@@ -228,8 +228,11 @@ int main(int argc, char **argv)
 		if(svm_check_probability_model(model)!=0)
 			info("Model supports probability estimates, but disabled in prediction.\n");
 	}
-
+	clock_t start,end;
+	start  = clock();
 	predict(input,output);
+	end = clock();
+	printf("%.2f",((double)(end-start))/CLOCKS_PER_SEC);
 	svm_free_and_destroy_model(&model);
 	free(x);
 	free(line);
