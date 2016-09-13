@@ -2424,11 +2424,10 @@ double svm_predict(const svm_model *model, const svm_node *x) {
 }
 __global__ void kernel_sigmoid_predict(const double *dec_values,
 		const double *probA, const double *probB, double *pairwise_prob,
-		int nr_class) {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	int j = blockIdx.y * blockDim.y + threadIdx.y;
-	if (i < j && i < nr_class && j < nr_class) {
-		int k = ((nr_class - 1) + (nr_class - i)) * i / 2 + j - i - 1;
+		int cnr2) {
+
+	int k = blockIdx.x * blockDim.x + threadIdx.x;
+	if (k < cnr2) {
 		double fApB = dec_values[k] * probA[k] + probB[k];
 		double result = 0;
 		double min_prob = 1e-7;
@@ -2441,9 +2440,27 @@ __global__ void kernel_sigmoid_predict(const double *dec_values,
 			result = min_prob;
 		if (result > 1 - min_prob)
 			result = 1 - min_prob;
-		pairwise_prob[i * nr_class + j] = result;
-		pairwise_prob[j * nr_class + i] = 1 - result;
+		pairwise_prob[k] = result;
 	}
+//	int i = blockIdx.x * blockDim.x + threadIdx.x;
+//	int j = blockIdx.y * blockDim.y + threadIdx.y;
+//	if (i < j && i < nr_class && j < nr_class) {
+//		int k = ((nr_class - 1) + (nr_class - i)) * i / 2 + j - i - 1;
+//		double fApB = dec_values[k] * probA[k] + probB[k];
+//		double result = 0;
+//		double min_prob = 1e-7;
+//		// 1-p used later; avoid catastrophic cancellation
+//		if (fApB >= 0)
+//			result = exp(-fApB) / (1.0 + exp(-fApB));
+//		else
+//			result = 1.0 / (1 + exp(fApB));
+//		if (result < min_prob)
+//			result = min_prob;
+//		if (result > 1 - min_prob)
+//			result = 1 - min_prob;
+//		pairwise_prob[i * nr_class + j] = result;
+//		pairwise_prob[j * nr_class + i] = 1 - result;
+//	}
 }
 double svm_predict_probability(const svm_model *model, const svm_node *x,
 		double *prob_estimates) {
@@ -2459,32 +2476,43 @@ double svm_predict_probability(const svm_model *model, const svm_node *x,
 			pairwise_prob[i] = Malloc(double, nr_class);
 
 		if (GPU) {
-			double *temp_pairwise_prob = Malloc(double, nr_class * nr_class);
-			double *d_dec_values, *d_probA, *d_probB, *d_pairwise_prob;
 			int cnr2 = nr_class * (nr_class - 1) / 2;
+			double *temp_pairwise_prob = Malloc(double, cnr2);
+			double *d_dec_values, *d_probA, *d_probB, *d_pairwise_prob;
 			cudaMalloc((void**) &d_dec_values, sizeof(double) * cnr2);
 			cudaMalloc((void**) &d_probA, sizeof(double) * cnr2);
 			cudaMalloc((void**) &d_probB, sizeof(double) * cnr2);
-			cudaMalloc((void**) &d_pairwise_prob,
-					sizeof(double) * nr_class * nr_class);
+			cudaMalloc((void**) &d_pairwise_prob, sizeof(double) * cnr2);
 			cudaMemcpy(d_dec_values, dec_values, sizeof(double) * cnr2,
 					cudaMemcpyHostToDevice);
 			cudaMemcpy(d_probA, model->probA, sizeof(double) * cnr2,
 					cudaMemcpyHostToDevice);
 			cudaMemcpy(d_probB, model->probB, sizeof(double) * cnr2,
 					cudaMemcpyHostToDevice);
-			dim3 threadPerBlock(THREAD_PER_BLOCK, THREAD_PER_BLOCK);
-			dim3 numBlocks(nr_class / threadPerBlock.x + 1,
-					nr_class / threadPerBlock.x + 1);
+//			dim3 threadPerBlock(THREAD_PER_BLOCK, THREAD_PER_BLOCK);
+//			dim3 numBlocks(nr_class / threadPerBlock.x + 1,
+//					nr_class / threadPerBlock.x + 1);
+			int threadPerBlock = 256;
+			int numBlocks = cnr2 / threadPerBlock + 1;
 			kernel_sigmoid_predict<<<numBlocks, threadPerBlock>>>(d_dec_values,
-					d_probA, d_probB, d_pairwise_prob, nr_class);
+					d_probA, d_probB, d_pairwise_prob, cnr2);
 			cudaMemcpy(temp_pairwise_prob, d_pairwise_prob,
-					sizeof(double) * nr_class * nr_class,
+					sizeof(double) * cnr2,
 					cudaMemcpyDeviceToHost);
-			for (i = 0; i < nr_class; i++) {
-				memcpy(pairwise_prob[i], temp_pairwise_prob + i * nr_class,
-						sizeof(double) * nr_class);
+			int k = 0;
+			for (i = 0; i < nr_class; i++){
+				for (int j = i + 1; j < nr_class; j++) {
+					pairwise_prob[i][j] = temp_pairwise_prob[k];
+					pairwise_prob[j][i] = 1 - pairwise_prob[i][j];
+					k++;
+//					printf("%lf ",temp_pairwise_prob[k]);
+				}
+//				printf("\n");
 			}
+//			for (i = 0; i < nr_class; i++) {
+//				memcpy(pairwise_prob[i], temp_pairwise_prob + i * nr_class,
+//						sizeof(double) * nr_class);
+//			}
 			free(temp_pairwise_prob);
 			cudaFree(d_dec_values);
 			cudaFree(d_probA);
