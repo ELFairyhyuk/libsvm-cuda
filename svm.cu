@@ -2335,7 +2335,35 @@ double svm_get_svr_probability(const svm_model *model) {
 		return 0;
 	}
 }
+__global__ void kernel_predict_values(const int *start, int *vote,
+		const int *nSV, const double *kvalue, const double *sv_coef,
+		const double *rho, double *dec_values) {
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	int j = blockIdx.y * blockDim.y + threadIdx.y;
+	if (i < j && i < nr_class && j < nr_class) {
+		int p = ((nr_class - 1) + (nr_class - i)) * i / 2 + j - i - 1;
+		double sum = 0;
+		int si = start[i];
+		int sj = start[j];
+		int ci = nSV[i];
+		int cj = nSV[j];
 
+		int k;
+		double *coef1 = sv_coef[j - 1];
+		double *coef2 = sv_coef[i];
+		for (k = 0; k < ci; k++)
+			sum += coef1[si + k] * kvalue[si + k];
+		for (k = 0; k < cj; k++)
+			sum += coef2[sj + k] * kvalue[sj + k];
+		sum -= rho[p];
+		dec_values[p] = sum;
+
+		if (dec_values[p] > 0)
+			++vote[i];
+		else
+			++vote[j];
+	}
+}
 double svm_predict_values(const svm_model *model, const svm_node *x,
 		double *dec_values) {
 	int i;
@@ -2371,31 +2399,76 @@ double svm_predict_values(const svm_model *model, const svm_node *x,
 		for (i = 0; i < nr_class; i++)
 			vote[i] = 0;
 
-		int p = 0;
+		int *d_start, *d_vote, *d_nSV;
+		double *d_kvalue, *d_sv_coef, *d_rho, *d_dec_values, *temp_sv_coef;
+		cudaMalloc((void**) &d_kvalue, sizeof(double) * l);
+		cudaMalloc((void**) &d_start, sizeof(int) * nr_class);
+		cudaMalloc((void**) &d_vote, sizeof(int) * nr_class);
+		cudaMalloc((void**) &d_nSV, sizeof(int) * nr_class);
+		cudaMalloc((void**) &d_sv_coef, sizeof(double) * nr_class * l);
+		cudaMalloc((void**) &d_rho,
+				sizeof(double) * nr_class * (nr_class - 1) / 2);
+		cudaMalloc((void**) &d_dec_values,
+				sizeof(double) * nr_class * (nr_class - 1) / 2);
+		temp_coef = Malloc(double, nr_class * l);
+		cudaMemcpy(d_kvalue, kvalue, sizeof(double) * l,
+				cudaMemcpyHostToDevice);
+		cudaMemcpy(d_start, start, sizeof(int) * nr_class,
+				cudaMemcpyHostToDevice);
+		cudaMemcpy(d_vote, vote, sizeof(int) * nr_class,
+				cudaMemcpyHostToDevice);
+		cudaMemcpy(d_nSV, model->nSV, sizeof(int) * nr_class,
+				cudaMemcpyHostToDevice);
+		cudaMemcpy(d_rho, model->rho,
+				sizeof(double) * nr_class * (nr_class - 1) / 2,
+				cudaMemcpyHostToDevice);
 		for (i = 0; i < nr_class; i++)
-			for (int j = i + 1; j < nr_class; j++) {
-				double sum = 0;
-				int si = start[i];
-				int sj = start[j];
-				int ci = model->nSV[i];
-				int cj = model->nSV[j];
-
-				int k;
-				double *coef1 = model->sv_coef[j - 1];
-				double *coef2 = model->sv_coef[i];
-				for (k = 0; k < ci; k++)
-					sum += coef1[si + k] * kvalue[si + k];
-				for (k = 0; k < cj; k++)
-					sum += coef2[sj + k] * kvalue[sj + k];
-				sum -= model->rho[p];
-				dec_values[p] = sum;
-
-				if (dec_values[p] > 0)
-					++vote[i];
-				else
-					++vote[j];
-				p++;
-			}
+			memcpy(temp_sv_coef + i * l, modeo->sv_coef[i], sizeof(double) * l);
+		cudaMemcpy(d_sv_coef, temp_sv_coef, sizeof(double) * nr_class * l,
+				cudaMemcpyHostToDevice);
+		dim3 threadPerBlock(16, 16);
+		dim3 numBlocks(nr_class / threadPerBlock.x + 1,
+				nr_class / threadPerBlock.x + 1);
+		kernel_predict_values<<<numBlocks, threadPerBlock>>>(d_start, d_vote,
+				d_nSV, d_kvalue, d_sv_coef, d_rho, d_dec_values);
+		cudaMemcpy(vote, d_vote, sizeof(int) * nr_class,
+				cudaMemcpyDeviceToHost);
+		cudaMemcpy(dec_vales, d_dec_values,
+				sizeof(double) * nr_class * (nr_class - 1) / 2,
+				cudaMemcpyDeviceToHost);
+		cudaFree(d_kvalue);
+		cudaFree(d_start);
+		cudaFree(d_vote);
+		cudaFree(d_nSV);
+		cudaFree(d_sv_coef);
+		cudaFree(d_rho);
+		cudaFree(d_dec_values);
+		free(temp_sv_coef);
+//		int p = 0;
+//		for (i = 0; i < nr_class; i++)
+//			for (int j = i + 1; j < nr_class; j++) {
+//				double sum = 0;
+//				int si = start[i];
+//				int sj = start[j];
+//				int ci = model->nSV[i];
+//				int cj = model->nSV[j];
+//
+//				int k;
+//				double *coef1 = model->sv_coef[j - 1];
+//				double *coef2 = model->sv_coef[i];
+//				for (k = 0; k < ci; k++)
+//					sum += coef1[si + k] * kvalue[si + k];
+//				for (k = 0; k < cj; k++)
+//					sum += coef2[sj + k] * kvalue[sj + k];
+//				sum -= model->rho[p];
+//				dec_values[p] = sum;
+//
+//				if (dec_values[p] > 0)
+//					++vote[i];
+//				else
+//					++vote[j];
+//				p++;
+//			}
 
 		int vote_max_idx = 0;
 		for (i = 1; i < nr_class; i++)
