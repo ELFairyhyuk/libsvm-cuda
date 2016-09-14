@@ -2437,7 +2437,8 @@ double svm_predict_values(const svm_model *model, const svm_node *x,
 	}
 }
 double svm_predict_values_gpu(const svm_model *model, const svm_node *x,
-		double *dec_values) {
+		double *dec_values, double *d_sv_coef, int *d_nSV, double *d_rho,
+		int *d_start) {
 	int i;
 	if (model->param.svm_type == ONE_CLASS
 			|| model->param.svm_type == EPSILON_SVR
@@ -2462,41 +2463,19 @@ double svm_predict_values_gpu(const svm_model *model, const svm_node *x,
 		for (i = 0; i < l; i++)
 			kvalue[i] = Kernel::k_function(x, model->SV[i], model->param);
 
-		int *start = Malloc(int, nr_class);
-		start[0] = 0;
-		for (i = 1; i < nr_class; i++)
-			start[i] = start[i - 1] + model->nSV[i - 1];
-
 		int *vote = Malloc(int, nr_class);
 		for (i = 0; i < nr_class; i++)
 			vote[i] = 0;
 
-		int *d_start, *d_vote, *d_nSV;
-		double *d_kvalue, *d_sv_coef, *d_rho, *d_dec_values, *temp_sv_coef;
+		int *d_vote;
+		double *d_kvalue, *d_dec_values;
 		cudaMalloc((void**) &d_kvalue, sizeof(double) * l);
-		cudaMalloc((void**) &d_start, sizeof(int) * nr_class);
 		cudaMalloc((void**) &d_vote, sizeof(int) * nr_class);
-		cudaMalloc((void**) &d_nSV, sizeof(int) * nr_class);
-		cudaMalloc((void**) &d_sv_coef, sizeof(double) * nr_class * l);
-		cudaMalloc((void**) &d_rho,
-				sizeof(double) * nr_class * (nr_class - 1) / 2);
 		cudaMalloc((void**) &d_dec_values,
 				sizeof(double) * nr_class * (nr_class - 1) / 2);
-		temp_sv_coef = Malloc(double, nr_class * l);
 		cudaMemcpy(d_kvalue, kvalue, sizeof(double) * l,
 				cudaMemcpyHostToDevice);
-		cudaMemcpy(d_start, start, sizeof(int) * nr_class,
-				cudaMemcpyHostToDevice);
 		cudaMemcpy(d_vote, vote, sizeof(int) * nr_class,
-				cudaMemcpyHostToDevice);
-		cudaMemcpy(d_nSV, model->nSV, sizeof(int) * nr_class,
-				cudaMemcpyHostToDevice);
-		cudaMemcpy(d_rho, model->rho,
-				sizeof(double) * nr_class * (nr_class - 1) / 2,
-				cudaMemcpyHostToDevice);
-		for (i = 0; i < nr_class - 1; i++)
-			memcpy(temp_sv_coef + i * l, model->sv_coef[i], sizeof(double) * l);
-		cudaMemcpy(d_sv_coef, temp_sv_coef, sizeof(double) * nr_class * l,
 				cudaMemcpyHostToDevice);
 		dim3 threadPerBlock(BLOCK_SIZE, BLOCK_SIZE);
 		dim3 numBlocks(nr_class / threadPerBlock.x + 1,
@@ -2509,13 +2488,8 @@ double svm_predict_values_gpu(const svm_model *model, const svm_node *x,
 				sizeof(double) * nr_class * (nr_class - 1) / 2,
 				cudaMemcpyDeviceToHost);
 		cudaFree(d_kvalue);
-		cudaFree(d_start);
 		cudaFree(d_vote);
-		cudaFree(d_nSV);
-		cudaFree(d_sv_coef);
-		cudaFree(d_rho);
 		cudaFree(d_dec_values);
-		free(temp_sv_coef);
 
 		int vote_max_idx = 0;
 		for (i = 1; i < nr_class; i++)
@@ -2523,7 +2497,6 @@ double svm_predict_values_gpu(const svm_model *model, const svm_node *x,
 				vote_max_idx = i;
 
 		free(kvalue);
-		free(start);
 		free(vote);
 		return model->label[vote_max_idx];
 	}
@@ -2603,13 +2576,15 @@ double svm_predict_probability(const svm_model *model, const svm_node *x,
 		return svm_predict(model, x);
 }
 double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
-		double *prob_estimates) {
+		double *prob_estimates, double *d_probA, double *d_probB,
+		double *d_sv_coef, int *d_nSV, double *d_rho, int *d_start) {
 	if ((model->param.svm_type == C_SVC || model->param.svm_type == NU_SVC)
 			&& model->probA != NULL && model->probB != NULL) {
 		int i;
 		int nr_class = model->nr_class;
 		double *dec_values = Malloc(double, nr_class * (nr_class - 1) / 2);
-		svm_predict_values_gpu(model, x, dec_values);
+		svm_predict_values_gpu(model, x, dec_values, d_sv_coef, d_nSV, d_rho,
+				d_start);
 
 		double **pairwise_prob = Malloc(double *, nr_class);
 		for (i = 0; i < nr_class; i++)
@@ -2617,16 +2592,10 @@ double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
 
 		int cnr2 = nr_class * (nr_class - 1) / 2;
 		double *temp_pairwise_prob = Malloc(double, cnr2);
-		double *d_dec_values, *d_probA, *d_probB, *d_pairwise_prob;
+		double *d_dec_values, *d_pairwise_prob;
 		cudaMalloc((void**) &d_dec_values, sizeof(double) * cnr2);
-		cudaMalloc((void**) &d_probA, sizeof(double) * cnr2);
-		cudaMalloc((void**) &d_probB, sizeof(double) * cnr2);
 		cudaMalloc((void**) &d_pairwise_prob, sizeof(double) * cnr2);
 		cudaMemcpy(d_dec_values, dec_values, sizeof(double) * cnr2,
-				cudaMemcpyHostToDevice);
-		cudaMemcpy(d_probA, model->probA, sizeof(double) * cnr2,
-				cudaMemcpyHostToDevice);
-		cudaMemcpy(d_probB, model->probB, sizeof(double) * cnr2,
 				cudaMemcpyHostToDevice);
 		int threadPerBlock = BLOCK_SIZE * BLOCK_SIZE;
 		int numBlocks = cnr2 / threadPerBlock + 1;
@@ -2643,8 +2612,6 @@ double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
 			}
 		free(temp_pairwise_prob);
 		cudaFree(d_dec_values);
-		cudaFree(d_probA);
-		cudaFree(d_probB);
 		cudaFree(d_pairwise_prob);
 		multiclass_probability(nr_class, pairwise_prob, prob_estimates);
 

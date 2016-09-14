@@ -7,6 +7,7 @@
 #include <time.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
+#define Malloc(type, n) (type *)malloc((n)*sizeof(type))
 int print_null(const char *s, ...) {
 	return 0;
 }
@@ -73,6 +74,44 @@ void predict(FILE *input, FILE *output) {
 
 	max_line_len = 1024;
 	line = (char *) malloc(max_line_len * sizeof(char));
+
+	//CUDA
+	int l = model->l;
+	int *d_nSV, *d_start;
+	double *d_probA, *d_probB, *d_sv_coef, *temp_sv_coef, *d_rho;
+	int *start = Malloc(int, nr_class);
+
+	int cnr2 = nr_class * (nr_class - 1) / 2;
+	if (GPU) {
+		start[0] = 0;
+		for (int i = 1; i < nr_class; i++)
+			start[i] = start[i - 1] + model->nSV[i - 1];
+		cudaMalloc((void**) &d_probA, sizeof(double) * cnr2);
+		cudaMalloc((void**) &d_probB, sizeof(double) * cnr2);
+		cudaMalloc((void**) &d_sv_coef, sizeof(double) * nr_class * l);
+		cudaMalloc((void**) &d_nSV, sizeof(int) * nr_class);
+		cudaMalloc((void**) &d_rho,
+				sizeof(double) * nr_class * (nr_class - 1) / 2);
+		cudaMalloc((void**) &d_start, sizeof(int) * nr_class);
+		temp_sv_coef = Malloc(double, nr_class * l);
+		cudaMemcpy(d_probA, model->probA, sizeof(double) * cnr2,
+				cudaMemcpyHostToDevice);
+		cudaMemcpy(d_probB, model->probB, sizeof(double) * cnr2,
+				cudaMemcpyHostToDevice);
+		for (int i = 0; i < nr_class - 1; i++)
+			memcpy(temp_sv_coef + i * l, model->sv_coef[i], sizeof(double) * l);
+		cudaMemcpy(d_sv_coef, temp_sv_coef, sizeof(double) * nr_class * l,
+				cudaMemcpyHostToDevice);
+		cudaMemcpy(d_nSV, model->nSV, sizeof(int) * nr_class,
+				cudaMemcpyHostToDevice);
+		cudaMemcpy(d_rho, model->rho,
+				sizeof(double) * nr_class * (nr_class - 1) / 2,
+				cudaMemcpyHostToDevice);
+		cudaMemcpy(d_start, start, sizeof(int) * nr_class,
+				cudaMemcpyHostToDevice);
+
+	}
+	//
 	while (readline(input) != NULL) {
 		int i = 0;
 		double target_label, predict_label;
@@ -121,7 +160,8 @@ void predict(FILE *input, FILE *output) {
 		if (predict_probability && (svm_type == C_SVC || svm_type == NU_SVC)) {
 			if (GPU) {
 				predict_label = svm_predict_probability_gpu(model, x,
-						prob_estimates);
+						prob_estimates, d_probA, d_probB, d_sv_coef, d_nSV,
+						d_rho, d_start);
 			} else {
 				predict_label = svm_predict_probability(model, x,
 						prob_estimates);
@@ -146,6 +186,19 @@ void predict(FILE *input, FILE *output) {
 		sumpt += predict_label * target_label;
 		++total;
 	}
+
+	//CUDA
+	if (GPU) {
+		free(temp_sv_coef);
+		free(start);
+		cudaFree(d_probA);
+		cudaFree(d_probB);
+		cudaFree(d_sv_coef);
+		cudaFree(d_nSV);
+		cudaFree(d_rho);
+		cudaFree(d_start);
+	}
+	//
 	if (svm_type == NU_SVR || svm_type == EPSILON_SVR) {
 		info("Mean squared error = %g (regression)\n", error / total);
 		info("Squared correlation coefficient = %g (regression)\n",
