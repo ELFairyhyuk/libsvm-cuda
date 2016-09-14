@@ -2335,9 +2335,9 @@ double svm_get_svr_probability(const svm_model *model) {
 		return 0;
 	}
 }
-__global__ void kernel_predict_values(const int *start, int *vote,
-		const int *nSV, const double *kvalue, const double *sv_coef,
-		const double *rho, double *dec_values) {
+__global__ void kernel_predict_values(int *start, int *vote, int *nSV,
+		double *kvalue, double *sv_coef, double *rho, double *dec_values,
+		int nr_class, int l) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	int j = blockIdx.y * blockDim.y + threadIdx.y;
 	if (i < j && i < nr_class && j < nr_class) {
@@ -2349,8 +2349,8 @@ __global__ void kernel_predict_values(const int *start, int *vote,
 		int cj = nSV[j];
 
 		int k;
-		double *coef1 = sv_coef[j - 1];
-		double *coef2 = sv_coef[i];
+		const double *coef1 = sv_coef + (j - 1) * l;
+		const double *coef2 = sv_coef + i * l;
 		for (k = 0; k < ci; k++)
 			sum += coef1[si + k] * kvalue[si + k];
 		for (k = 0; k < cj; k++)
@@ -2399,6 +2399,78 @@ double svm_predict_values(const svm_model *model, const svm_node *x,
 		for (i = 0; i < nr_class; i++)
 			vote[i] = 0;
 
+		int p = 0;
+		for (i = 0; i < nr_class; i++)
+			for (int j = i + 1; j < nr_class; j++) {
+				double sum = 0;
+				int si = start[i];
+				int sj = start[j];
+				int ci = model->nSV[i];
+				int cj = model->nSV[j];
+
+				int k;
+				double *coef1 = model->sv_coef[j - 1];
+				double *coef2 = model->sv_coef[i];
+				for (k = 0; k < ci; k++)
+					sum += coef1[si + k] * kvalue[si + k];
+				for (k = 0; k < cj; k++)
+					sum += coef2[sj + k] * kvalue[sj + k];
+				sum -= model->rho[p];
+				dec_values[p] = sum;
+
+				if (dec_values[p] > 0)
+					++vote[i];
+				else
+					++vote[j];
+				p++;
+			}
+
+		int vote_max_idx = 0;
+		for (i = 1; i < nr_class; i++)
+			if (vote[i] > vote[vote_max_idx])
+				vote_max_idx = i;
+
+		free(kvalue);
+		free(start);
+		free(vote);
+		return model->label[vote_max_idx];
+	}
+}
+double svm_predict_values_gpu(const svm_model *model, const svm_node *x,
+		double *dec_values) {
+	int i;
+	if (model->param.svm_type == ONE_CLASS
+			|| model->param.svm_type == EPSILON_SVR
+			|| model->param.svm_type == NU_SVR) {
+		double *sv_coef = model->sv_coef[0];
+		double sum = 0;
+		for (i = 0; i < model->l; i++)
+			sum += sv_coef[i]
+					* Kernel::k_function(x, model->SV[i], model->param);
+		sum -= model->rho[0];
+		*dec_values = sum;
+
+		if (model->param.svm_type == ONE_CLASS)
+			return (sum > 0) ? 1 : -1;
+		else
+			return sum;
+	} else {
+		int nr_class = model->nr_class;
+		int l = model->l;
+
+		double *kvalue = Malloc(double, l);
+		for (i = 0; i < l; i++)
+			kvalue[i] = Kernel::k_function(x, model->SV[i], model->param);
+
+		int *start = Malloc(int, nr_class);
+		start[0] = 0;
+		for (i = 1; i < nr_class; i++)
+			start[i] = start[i - 1] + model->nSV[i - 1];
+
+		int *vote = Malloc(int, nr_class);
+		for (i = 0; i < nr_class; i++)
+			vote[i] = 0;
+
 		int *d_start, *d_vote, *d_nSV;
 		double *d_kvalue, *d_sv_coef, *d_rho, *d_dec_values, *temp_sv_coef;
 		cudaMalloc((void**) &d_kvalue, sizeof(double) * l);
@@ -2410,7 +2482,7 @@ double svm_predict_values(const svm_model *model, const svm_node *x,
 				sizeof(double) * nr_class * (nr_class - 1) / 2);
 		cudaMalloc((void**) &d_dec_values,
 				sizeof(double) * nr_class * (nr_class - 1) / 2);
-		temp_coef = Malloc(double, nr_class * l);
+		temp_sv_coef = Malloc(double, nr_class * l);
 		cudaMemcpy(d_kvalue, kvalue, sizeof(double) * l,
 				cudaMemcpyHostToDevice);
 		cudaMemcpy(d_start, start, sizeof(int) * nr_class,
@@ -2422,18 +2494,18 @@ double svm_predict_values(const svm_model *model, const svm_node *x,
 		cudaMemcpy(d_rho, model->rho,
 				sizeof(double) * nr_class * (nr_class - 1) / 2,
 				cudaMemcpyHostToDevice);
-		for (i = 0; i < nr_class; i++)
-			memcpy(temp_sv_coef + i * l, modeo->sv_coef[i], sizeof(double) * l);
+		for (i = 0; i < nr_class - 1; i++)
+			memcpy(temp_sv_coef + i * l, model->sv_coef[i], sizeof(double) * l);
 		cudaMemcpy(d_sv_coef, temp_sv_coef, sizeof(double) * nr_class * l,
 				cudaMemcpyHostToDevice);
-		dim3 threadPerBlock(16, 16);
+		dim3 threadPerBlock(BLOCK_SIZE, BLOCK_SIZE);
 		dim3 numBlocks(nr_class / threadPerBlock.x + 1,
 				nr_class / threadPerBlock.x + 1);
 		kernel_predict_values<<<numBlocks, threadPerBlock>>>(d_start, d_vote,
-				d_nSV, d_kvalue, d_sv_coef, d_rho, d_dec_values);
+				d_nSV, d_kvalue, d_sv_coef, d_rho, d_dec_values, nr_class, l);
 		cudaMemcpy(vote, d_vote, sizeof(int) * nr_class,
 				cudaMemcpyDeviceToHost);
-		cudaMemcpy(dec_vales, d_dec_values,
+		cudaMemcpy(dec_values, d_dec_values,
 				sizeof(double) * nr_class * (nr_class - 1) / 2,
 				cudaMemcpyDeviceToHost);
 		cudaFree(d_kvalue);
@@ -2444,31 +2516,6 @@ double svm_predict_values(const svm_model *model, const svm_node *x,
 		cudaFree(d_rho);
 		cudaFree(d_dec_values);
 		free(temp_sv_coef);
-//		int p = 0;
-//		for (i = 0; i < nr_class; i++)
-//			for (int j = i + 1; j < nr_class; j++) {
-//				double sum = 0;
-//				int si = start[i];
-//				int sj = start[j];
-//				int ci = model->nSV[i];
-//				int cj = model->nSV[j];
-//
-//				int k;
-//				double *coef1 = model->sv_coef[j - 1];
-//				double *coef2 = model->sv_coef[i];
-//				for (k = 0; k < ci; k++)
-//					sum += coef1[si + k] * kvalue[si + k];
-//				for (k = 0; k < cj; k++)
-//					sum += coef2[sj + k] * kvalue[sj + k];
-//				sum -= model->rho[p];
-//				dec_values[p] = sum;
-//
-//				if (dec_values[p] > 0)
-//					++vote[i];
-//				else
-//					++vote[j];
-//				p++;
-//			}
 
 		int vote_max_idx = 0;
 		for (i = 1; i < nr_class; i++)
@@ -2529,52 +2576,76 @@ double svm_predict_probability(const svm_model *model, const svm_node *x,
 		for (i = 0; i < nr_class; i++)
 			pairwise_prob[i] = Malloc(double, nr_class);
 
-		if (GPU) {
-			int cnr2 = nr_class * (nr_class - 1) / 2;
-			double *temp_pairwise_prob = Malloc(double, cnr2);
-			double *d_dec_values, *d_probA, *d_probB, *d_pairwise_prob;
-			cudaMalloc((void**) &d_dec_values, sizeof(double) * cnr2);
-			cudaMalloc((void**) &d_probA, sizeof(double) * cnr2);
-			cudaMalloc((void**) &d_probB, sizeof(double) * cnr2);
-			cudaMalloc((void**) &d_pairwise_prob, sizeof(double) * cnr2);
-			cudaMemcpy(d_dec_values, dec_values, sizeof(double) * cnr2,
-					cudaMemcpyHostToDevice);
-			cudaMemcpy(d_probA, model->probA, sizeof(double) * cnr2,
-					cudaMemcpyHostToDevice);
-			cudaMemcpy(d_probB, model->probB, sizeof(double) * cnr2,
-					cudaMemcpyHostToDevice);
-			int threadPerBlock = 256;
-			int numBlocks = cnr2 / threadPerBlock + 1;
-			kernel_sigmoid_predict<<<numBlocks, threadPerBlock>>>(d_dec_values,
-					d_probA, d_probB, d_pairwise_prob, cnr2);
-			cudaMemcpy(temp_pairwise_prob, d_pairwise_prob,
-					sizeof(double) * cnr2, cudaMemcpyDeviceToHost);
-			int k = 0;
-			for (i = 0; i < nr_class; i++)
-				for (int j = i + 1; j < nr_class; j++) {
-					pairwise_prob[i][j] = temp_pairwise_prob[k];
-					pairwise_prob[j][i] = 1 - pairwise_prob[i][j];
-					k++;
-				}
-			free(temp_pairwise_prob);
-			cudaFree(d_dec_values);
-			cudaFree(d_probA);
-			cudaFree(d_probB);
-			cudaFree(d_pairwise_prob);
-		} else {
-			double min_prob = 1e-7;
-			int k = 0;
-			for (i = 0; i < nr_class; i++)
-				for (int j = i + 1; j < nr_class; j++) {
-					pairwise_prob[i][j] = min(
-							max(
-									sigmoid_predict(dec_values[k],
-											model->probA[k], model->probB[k]),
-									min_prob), 1 - min_prob);
-					pairwise_prob[j][i] = 1 - pairwise_prob[i][j];
-					k++;
-				}
-		}
+		double min_prob = 1e-7;
+		int k = 0;
+		for (i = 0; i < nr_class; i++)
+			for (int j = i + 1; j < nr_class; j++) {
+				pairwise_prob[i][j] = min(
+						max(
+								sigmoid_predict(dec_values[k], model->probA[k],
+										model->probB[k]), min_prob),
+						1 - min_prob);
+				pairwise_prob[j][i] = 1 - pairwise_prob[i][j];
+				k++;
+			}
+		multiclass_probability(nr_class, pairwise_prob, prob_estimates);
+
+		int prob_max_idx = 0;
+		for (i = 1; i < nr_class; i++)
+			if (prob_estimates[i] > prob_estimates[prob_max_idx])
+				prob_max_idx = i;
+		for (i = 0; i < nr_class; i++)
+			free(pairwise_prob[i]);
+		free(dec_values);
+		free(pairwise_prob);
+		return model->label[prob_max_idx];
+	} else
+		return svm_predict(model, x);
+}
+double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
+		double *prob_estimates) {
+	if ((model->param.svm_type == C_SVC || model->param.svm_type == NU_SVC)
+			&& model->probA != NULL && model->probB != NULL) {
+		int i;
+		int nr_class = model->nr_class;
+		double *dec_values = Malloc(double, nr_class * (nr_class - 1) / 2);
+		svm_predict_values_gpu(model, x, dec_values);
+
+		double **pairwise_prob = Malloc(double *, nr_class);
+		for (i = 0; i < nr_class; i++)
+			pairwise_prob[i] = Malloc(double, nr_class);
+
+		int cnr2 = nr_class * (nr_class - 1) / 2;
+		double *temp_pairwise_prob = Malloc(double, cnr2);
+		double *d_dec_values, *d_probA, *d_probB, *d_pairwise_prob;
+		cudaMalloc((void**) &d_dec_values, sizeof(double) * cnr2);
+		cudaMalloc((void**) &d_probA, sizeof(double) * cnr2);
+		cudaMalloc((void**) &d_probB, sizeof(double) * cnr2);
+		cudaMalloc((void**) &d_pairwise_prob, sizeof(double) * cnr2);
+		cudaMemcpy(d_dec_values, dec_values, sizeof(double) * cnr2,
+				cudaMemcpyHostToDevice);
+		cudaMemcpy(d_probA, model->probA, sizeof(double) * cnr2,
+				cudaMemcpyHostToDevice);
+		cudaMemcpy(d_probB, model->probB, sizeof(double) * cnr2,
+				cudaMemcpyHostToDevice);
+		int threadPerBlock = BLOCK_SIZE * BLOCK_SIZE;
+		int numBlocks = cnr2 / threadPerBlock + 1;
+		kernel_sigmoid_predict<<<numBlocks, threadPerBlock>>>(d_dec_values,
+				d_probA, d_probB, d_pairwise_prob, cnr2);
+		cudaMemcpy(temp_pairwise_prob, d_pairwise_prob, sizeof(double) * cnr2,
+				cudaMemcpyDeviceToHost);
+		int k = 0;
+		for (i = 0; i < nr_class; i++)
+			for (int j = i + 1; j < nr_class; j++) {
+				pairwise_prob[i][j] = temp_pairwise_prob[k];
+				pairwise_prob[j][i] = 1 - pairwise_prob[i][j];
+				k++;
+			}
+		free(temp_pairwise_prob);
+		cudaFree(d_dec_values);
+		cudaFree(d_probA);
+		cudaFree(d_probB);
+		cudaFree(d_pairwise_prob);
 		multiclass_probability(nr_class, pairwise_prob, prob_estimates);
 
 		int prob_max_idx = 0;
