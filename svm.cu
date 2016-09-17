@@ -9,8 +9,13 @@
 #include <locale.h>
 #include <time.h>
 #include "svm.h"
+
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
+#include <thrust/inner_product.h>
+#include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
+
 int libsvm_version = LIBSVM_VERSION;
 typedef float Qfloat;
 typedef signed char schar;
@@ -2349,12 +2354,16 @@ __global__ void kernel_predict_values(int *start, int *vote, int *nSV,
 		int cj = nSV[j];
 
 		int k;
-		const double *coef1 = sv_coef + (j - 1) * l;
-		const double *coef2 = sv_coef + i * l;
-		for (k = 0; k < ci; k++)
-			sum += coef1[si + k] * kvalue[si + k];
-		for (k = 0; k < cj; k++)
-			sum += coef2[sj + k] * kvalue[sj + k];
+		double *coef1 = sv_coef + (j - 1) * l;
+		double *coef2 = sv_coef + i * l;
+		sum += thrust::inner_product(thrust::device, coef1 + si,
+				coef1 + si + ci, kvalue + si, 0.0);
+		sum += thrust::inner_product(thrust::device, coef2 + sj,
+				coef2 + sj + cj, kvalue + sj, 0.0);
+//		for (k = 0; k < ci; k++)
+//			sum += coef1[si + k] * kvalue[si + k];
+//		for (k = 0; k < cj; k++)
+//			sum += coef2[sj + k] * kvalue[sj + k];
 		sum -= rho[p];
 		dec_values[p] = sum;
 
@@ -2437,7 +2446,7 @@ double svm_predict_values(const svm_model *model, const svm_node *x,
 	}
 }
 double svm_predict_values_gpu(const svm_model *model, const svm_node *x,
-		double *dec_values, double *d_sv_coef, int *d_nSV, double *d_rho,
+		double *d_dec_values, double *d_sv_coef, int *d_nSV, double *d_rho,
 		int *d_start) {
 	int i;
 	if (model->param.svm_type == ONE_CLASS
@@ -2449,7 +2458,7 @@ double svm_predict_values_gpu(const svm_model *model, const svm_node *x,
 			sum += sv_coef[i]
 					* Kernel::k_function(x, model->SV[i], model->param);
 		sum -= model->rho[0];
-		*dec_values = sum;
+		*d_dec_values = sum;
 
 		if (model->param.svm_type == ONE_CLASS)
 			return (sum > 0) ? 1 : -1;
@@ -2468,29 +2477,23 @@ double svm_predict_values_gpu(const svm_model *model, const svm_node *x,
 			vote[i] = 0;
 
 		int *d_vote;
-		double *d_kvalue, *d_dec_values;
+		double *d_kvalue;
 		cudaMalloc((void**) &d_kvalue, sizeof(double) * l);
 		cudaMalloc((void**) &d_vote, sizeof(int) * nr_class);
-		cudaMalloc((void**) &d_dec_values,
-				sizeof(double) * nr_class * (nr_class - 1) / 2);
 		cudaMemcpy(d_kvalue, kvalue, sizeof(double) * l,
 				cudaMemcpyHostToDevice);
 		cudaMemcpy(d_vote, vote, sizeof(int) * nr_class,
 				cudaMemcpyHostToDevice);
 		dim3 threadPerBlock(BLOCK_SIZE, BLOCK_SIZE);
-		dim3 numBlocks(nr_class / threadPerBlock.x + 1,
-				nr_class / threadPerBlock.x + 1);
+		dim3 numBlocks((nr_class + threadPerBlock.x - 1) / threadPerBlock.x,
+				(nr_class + threadPerBlock.y - 1) / threadPerBlock.y);
 		kernel_predict_values<<<numBlocks, threadPerBlock>>>(d_start, d_vote,
 				d_nSV, d_kvalue, d_sv_coef, d_rho, d_dec_values, nr_class, l);
 		cudaMemcpy(vote, d_vote, sizeof(int) * nr_class,
 				cudaMemcpyDeviceToHost);
-		cudaMemcpy(dec_values, d_dec_values,
-				sizeof(double) * nr_class * (nr_class - 1) / 2,
-				cudaMemcpyDeviceToHost);
+
 		cudaFree(d_kvalue);
 		cudaFree(d_vote);
-		cudaFree(d_dec_values);
-
 		int vote_max_idx = 0;
 		for (i = 1; i < nr_class; i++)
 			if (vote[i] > vote[vote_max_idx])
@@ -2519,9 +2522,9 @@ __global__ void kernel_sigmoid_predict(const double *dec_values,
 		const double *probA, const double *probB, double *pairwise_prob,
 		int cnr2) {
 
-	int k = blockIdx.x * blockDim.x + threadIdx.x;
-	if (k < cnr2) {
-		double fApB = dec_values[k] * probA[k] + probB[k];
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid < cnr2) {
+		double fApB = dec_values[tid] * probA[tid] + probB[tid];
 		double result = 0;
 		double min_prob = 1e-7;
 		// 1-p used later; avoid catastrophic cancellation
@@ -2533,7 +2536,7 @@ __global__ void kernel_sigmoid_predict(const double *dec_values,
 			result = min_prob;
 		if (result > 1 - min_prob)
 			result = 1 - min_prob;
-		pairwise_prob[k] = result;
+		pairwise_prob[tid] = result;
 	}
 }
 double svm_predict_probability(const svm_model *model, const svm_node *x,
@@ -2582,23 +2585,22 @@ double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
 			&& model->probA != NULL && model->probB != NULL) {
 		int i;
 		int nr_class = model->nr_class;
-		double *dec_values = Malloc(double, nr_class * (nr_class - 1) / 2);
-		svm_predict_values_gpu(model, x, dec_values, d_sv_coef, d_nSV, d_rho,
+		int cnr2 = nr_class * (nr_class - 1) / 2;
+		double *d_dec_values;
+		cudaMalloc((void**) &d_dec_values, sizeof(double) * cnr2);
+		svm_predict_values_gpu(model, x, d_dec_values, d_sv_coef, d_nSV, d_rho,
 				d_start);
 
 		double **pairwise_prob = Malloc(double *, nr_class);
 		for (i = 0; i < nr_class; i++)
 			pairwise_prob[i] = Malloc(double, nr_class);
 
-		int cnr2 = nr_class * (nr_class - 1) / 2;
 		double *temp_pairwise_prob = Malloc(double, cnr2);
-		double *d_dec_values, *d_pairwise_prob;
-		cudaMalloc((void**) &d_dec_values, sizeof(double) * cnr2);
+		double *d_pairwise_prob;
 		cudaMalloc((void**) &d_pairwise_prob, sizeof(double) * cnr2);
-		cudaMemcpy(d_dec_values, dec_values, sizeof(double) * cnr2,
-				cudaMemcpyHostToDevice);
+
 		int threadPerBlock = BLOCK_SIZE * BLOCK_SIZE;
-		int numBlocks = cnr2 / threadPerBlock + 1;
+		int numBlocks = (cnr2 + threadPerBlock - 1) / threadPerBlock;
 		kernel_sigmoid_predict<<<numBlocks, threadPerBlock>>>(d_dec_values,
 				d_probA, d_probB, d_pairwise_prob, cnr2);
 		cudaMemcpy(temp_pairwise_prob, d_pairwise_prob, sizeof(double) * cnr2,
@@ -2621,7 +2623,6 @@ double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
 				prob_max_idx = i;
 		for (i = 0; i < nr_class; i++)
 			free(pairwise_prob[i]);
-		free(dec_values);
 		free(pairwise_prob);
 		return model->label[prob_max_idx];
 	} else
