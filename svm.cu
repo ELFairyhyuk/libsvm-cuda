@@ -2356,14 +2356,14 @@ __global__ void kernel_predict_values(int *start, int *vote, int *nSV,
 		int k;
 		double *coef1 = sv_coef + (j - 1) * l;
 		double *coef2 = sv_coef + i * l;
-		sum += thrust::inner_product(thrust::device, coef1 + si,
-				coef1 + si + ci, kvalue + si, 0.0);
-		sum += thrust::inner_product(thrust::device, coef2 + sj,
-				coef2 + sj + cj, kvalue + sj, 0.0);
-//		for (k = 0; k < ci; k++)
-//			sum += coef1[si + k] * kvalue[si + k];
-//		for (k = 0; k < cj; k++)
-//			sum += coef2[sj + k] * kvalue[sj + k];
+//		sum += thrust::inner_product(thrust::device, coef1 + si,
+//				coef1 + si + ci, kvalue + si, 0.0);
+//		sum += thrust::inner_product(thrust::device, coef2 + sj,
+//				coef2 + sj + cj, kvalue + sj, 0.0);
+		for (k = 0; k < ci; k++)
+			sum += coef1[si + k] * kvalue[si + k];
+		for (k = 0; k < cj; k++)
+			sum += coef2[sj + k] * kvalue[sj + k];
 		sum -= rho[p];
 		dec_values[p] = sum;
 
