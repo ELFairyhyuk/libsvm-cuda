@@ -1765,18 +1765,20 @@ static void multiclass_probability(int k, double **r, double *p) {
 	free(Q);
 	free(Qp);
 }
-__global__ void dot(double *a, double *b, double *c, int k) {
-	__shared__ double temp[BLOCK_SIZE];
-	int index = threadIdx.x + blockIdx.x * blockDim.x;
-	temp[threadIdx.x] = (1 - a[index * k]) * (1 - b[index * k]);
+__global__ void kernel_inner_product(const double *a, const double *b,
+		const int k, double *c) {
+	extern __shared__ double cache[];
+	const unsigned int tid = threadIdx.x;
+	cache[tid] = a[tid] * b[tid];
 	__syncthreads();
-	if (0 == threadIdx.x) {
+	if (0 == tid) {
 		double sum = 0;
-		for (int i = 0; i < BLOCK_SIZE; i++)
-			sum += temp[i];
-		atomicAdd(c, sum);
+		for (int i = 0; i < k; i++)
+			sum += cache[i];
+		*c = sum;
 	}
 }
+
 __global__ void kernel_calculate_Q(int k, double *Q, double *r) {
 	int t = blockIdx.x * blockDim.x + threadIdx.x;
 	int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1801,6 +1803,14 @@ __global__ void kernel_calculate_Q_diag(int k, double *Q, double *r) {
 __global__ void kernel_init_p(double *p, int k) {
 	p[threadIdx.x] = 1.0 / k;
 }
+__global__ void kernel_update_pQp(double *pQp, double *Qp, double *Q, double *p,
+		int k) {
+	int t = threadIdx.x;
+	kernel_inner_product<<<1, k, sizeof(double) * k>>>(Q + t * k, p, k, Qp + t);
+	__syncthreads();
+	if (0 == t)
+		*pQp = thrust::inner_product(thrust::device, p, p + k, Qp, 0.0);
+}
 static void multiclass_probability_gpu(int k, double *r, double *p) {
 	int t, j;
 	int iter = 0, max_iter = max(100, k);
@@ -1808,10 +1818,12 @@ static void multiclass_probability_gpu(int k, double *r, double *p) {
 	double *Qp = Malloc(double, k);
 	double pQp, eps = 0.005 / k;
 
-	double *d_r, *d_Q, *d_p;
+	double *d_r, *d_Q, *d_p, *d_Qp, *d_pQp;
 	cudaMalloc((void**) &d_r, sizeof(double) * k * k);
 	cudaMalloc((void**) &d_Q, sizeof(double) * k * k);
 	cudaMalloc((void**) &d_p, sizeof(double) * k);
+	cudaMalloc((void**) &d_Qp, sizeof(double) * k);
+	cudaMalloc((void**) &d_pQp, sizeof(double));
 	cudaMemcpy(d_r, r, sizeof(double) * k * k, cudaMemcpyHostToDevice);
 	dim3 threadPerBlock(BLOCK_SIZE, BLOCK_SIZE);
 	dim3 numBlocks((k + threadPerBlock.x - 1) / threadPerBlock.x,
@@ -1823,13 +1835,22 @@ static void multiclass_probability_gpu(int k, double *r, double *p) {
 	cudaMemcpy(p, d_p, sizeof(double) * k, cudaMemcpyDeviceToHost);
 	for (iter = 0; iter < max_iter; iter++) {
 		// stopping condition, recalculate QP,pQP for numerical accuracy
-		pQp = 0;
-		for (t = 0; t < k; t++) {
-			Qp[t] = 0;
-			for (j = 0; j < k; j++)
-				Qp[t] += Q[t * k + j] * p[j];
-			pQp += p[t] * Qp[t];
-		}
+//		pQp = 0;
+//		for (t = 0; t < k; t++) {
+//			Qp[t] = 0;
+//			for (j = 0; j < k; j++)
+//				Qp[t] += Q[t * k + j] * p[j];
+//			pQp += p[t] * Qp[t];
+//		}
+		cudaMemcpy(d_Q, Q, sizeof(double) * k * k, cudaMemcpyHostToDevice);
+		cudaMemcpy(d_p, p, sizeof(double) * k, cudaMemcpyHostToDevice);
+		cudaMemcpy(d_Qp, Qp, sizeof(double) * k, cudaMemcpyHostToDevice);
+		cudaMemcpy(d_pQp, &pQp, sizeof(double) * 1, cudaMemcpyHostToDevice);
+		kernel_update_pQp<<<1, k>>>(d_pQp, d_Qp, d_Q, d_p, k);
+		cudaMemcpy(Q, d_Q, sizeof(double) * k * k, cudaMemcpyDeviceToHost);
+		cudaMemcpy(p, d_p, sizeof(double) * k, cudaMemcpyDeviceToHost);
+		cudaMemcpy(Qp, d_Qp, sizeof(double) * k, cudaMemcpyDeviceToHost);
+		cudaMemcpy(&pQp, d_pQp, sizeof(double) * 1, cudaMemcpyDeviceToHost);
 		double max_error = 0;
 		for (t = 0; t < k; t++) {
 			double error = fabs(Qp[t] - pQp);
@@ -1858,6 +1879,8 @@ static void multiclass_probability_gpu(int k, double *r, double *p) {
 	free(Qp);
 	cudaFree(d_Q);
 	cudaFree(d_r);
+	cudaFree(d_Qp);
+	cudaFree(d_pQp);
 }
 
 // Cross-validation decision values for probability estimates
