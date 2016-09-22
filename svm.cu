@@ -1765,6 +1765,100 @@ static void multiclass_probability(int k, double **r, double *p) {
 	free(Q);
 	free(Qp);
 }
+__global__ void dot(double *a, double *b, double *c, int k) {
+	__shared__ double temp[BLOCK_SIZE];
+	int index = threadIdx.x + blockIdx.x * blockDim.x;
+	temp[threadIdx.x] = (1 - a[index * k]) * (1 - b[index * k]);
+	__syncthreads();
+	if (0 == threadIdx.x) {
+		double sum = 0;
+		for (int i = 0; i < BLOCK_SIZE; i++)
+			sum += temp[i];
+		atomicAdd(c, sum);
+	}
+}
+__global__ void kernel_calculate_Q(int k, double *Q, double *r) {
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	int j = blockIdx.y * blockDim.y + threadIdx.y;
+	if (t < k && j < k) {
+		Q[t * k + j] = -r[j * k + t] * r[t * k + j];
+	}
+}
+
+__global__ void kernel_calculate_Q_diag(int k, double *Q, double *r) {
+	int t = blockIdx.x;
+	int j = threadIdx.x;
+	extern __shared__ double temp[];
+	temp[j] = r[j * k + t] * r[j * k + t];
+	__syncthreads();
+	if (0 == threadIdx.x) {
+		double sum = 0;
+		for (int i = 0; i < k; i++)
+			sum += temp[i];
+		Q[t * k + t] = sum - r[t * k + t] * r[t * k + t];
+	}
+}
+__global__ void kernel_init_p(double *p, int k) {
+	p[threadIdx.x] = 1.0 / k;
+}
+static void multiclass_probability_gpu(int k, double *r, double *p) {
+	int t, j;
+	int iter = 0, max_iter = max(100, k);
+	double *Q = Malloc(double, k * k);
+	double *Qp = Malloc(double, k);
+	double pQp, eps = 0.005 / k;
+
+	double *d_r, *d_Q, *d_p;
+	cudaMalloc((void**) &d_r, sizeof(double) * k * k);
+	cudaMalloc((void**) &d_Q, sizeof(double) * k * k);
+	cudaMalloc((void**) &d_p, sizeof(double) * k);
+	cudaMemcpy(d_r, r, sizeof(double) * k * k, cudaMemcpyHostToDevice);
+	dim3 threadPerBlock(BLOCK_SIZE, BLOCK_SIZE);
+	dim3 numBlocks((k + threadPerBlock.x - 1) / threadPerBlock.x,
+			(k + threadPerBlock.y - 1) / threadPerBlock.y);
+	kernel_calculate_Q<<<numBlocks, threadPerBlock>>>(k, d_Q, d_r);
+	kernel_calculate_Q_diag<<<k, k, sizeof(double) * k>>>(k, d_Q, d_r);
+	kernel_init_p<<<1, k>>>(d_p, k);
+	cudaMemcpy(Q, d_Q, sizeof(double) * k * k, cudaMemcpyDeviceToHost);
+	cudaMemcpy(p, d_p, sizeof(double) * k, cudaMemcpyDeviceToHost);
+	for (iter = 0; iter < max_iter; iter++) {
+		// stopping condition, recalculate QP,pQP for numerical accuracy
+		pQp = 0;
+		for (t = 0; t < k; t++) {
+			Qp[t] = 0;
+			for (j = 0; j < k; j++)
+				Qp[t] += Q[t * k + j] * p[j];
+			pQp += p[t] * Qp[t];
+		}
+		double max_error = 0;
+		for (t = 0; t < k; t++) {
+			double error = fabs(Qp[t] - pQp);
+			if (error > max_error)
+				max_error = error;
+		}
+		if (max_error < eps)
+			break;
+
+		for (t = 0; t < k; t++) {
+			double diff = (-Qp[t] + pQp) / Q[t * k + t];
+			p[t] += diff;
+			pQp = (pQp + diff * (diff * Q[t * k + t] + 2 * Qp[t])) / (1 + diff)
+					/ (1 + diff);
+			for (j = 0; j < k; j++) {
+				Qp[j] = (Qp[j] + diff * Q[t * k + j]) / (1 + diff);
+				p[j] /= (1 + diff);
+			}
+		}
+	}
+	if (iter >= max_iter)
+		info("Exceeds max_iter in multiclass_prob\n");
+//	for (t = 0; t < k; t++)
+//		free(Q[t]);
+	free(Q);
+	free(Qp);
+	cudaFree(d_Q);
+	cudaFree(d_r);
+}
 
 // Cross-validation decision values for probability estimates
 static void svm_binary_svc_probability(const svm_problem *prob,
@@ -1775,7 +1869,7 @@ static void svm_binary_svc_probability(const svm_problem *prob,
 	int *perm = Malloc(int, prob->l);
 	double *dec_values = Malloc(double, prob->l);
 
-	// random shuffle
+// random shuffle
 	for (i = 0; i < prob->l; i++)
 		perm[i] = i;
 	for (i = 0; i < prob->l; i++) {
@@ -1914,11 +2008,11 @@ static void svm_group_classes(const svm_problem *prob, int *nr_class_ret,
 		}
 	}
 
-	//
-	// Labels are ordered by their first occurrence in the training set.
-	// However, for two-class sets with -1/+1 labels and -1 appears first,
-	// we swap labels to ensure that internally the binary SVM has positive data corresponding to the +1 instances.
-	//
+//
+// Labels are ordered by their first occurrence in the training set.
+// However, for two-class sets with -1/+1 labels and -1 appears first,
+// we swap labels to ensure that internally the binary SVM has positive data corresponding to the +1 instances.
+//
 	if (nr_class == 2 && label[0] == -1 && label[1] == 1) {
 		swap(label[0], label[1]);
 		swap(count[0], count[1]);
@@ -2209,8 +2303,8 @@ void svm_cross_validation(const svm_problem *prob, const svm_parameter *param,
 				"WARNING: # folds > # data. Will use # folds = # data instead (i.e., leave-one-out cross validation)\n");
 	}
 	fold_start = Malloc(int, nr_fold + 1);
-	// stratified cv may not give leave-one-out rate
-	// Each class to l folds -> some folds may have zero elements
+// stratified cv may not give leave-one-out rate
+// Each class to l folds -> some folds may have zero elements
 	if ((param->svm_type == C_SVC || param->svm_type == NU_SVC)
 			&& nr_fold < l) {
 		int *start = NULL;
@@ -2591,9 +2685,10 @@ double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
 		svm_predict_values_gpu(model, x, d_dec_values, d_sv_coef, d_nSV, d_rho,
 				d_start);
 
-		double **pairwise_prob = Malloc(double *, nr_class);
-		for (i = 0; i < nr_class; i++)
-			pairwise_prob[i] = Malloc(double, nr_class);
+//		double **pairwise_prob = Malloc(double *, nr_class);
+//		for (i = 0; i < nr_class; i++)
+//			pairwise_prob[i] = Malloc(double, nr_class);
+		double *pairwise_prob = Malloc(double, nr_class * nr_class);
 
 		double *temp_pairwise_prob = Malloc(double, cnr2);
 		double *d_pairwise_prob;
@@ -2608,21 +2703,22 @@ double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
 		int k = 0;
 		for (i = 0; i < nr_class; i++)
 			for (int j = i + 1; j < nr_class; j++) {
-				pairwise_prob[i][j] = temp_pairwise_prob[k];
-				pairwise_prob[j][i] = 1 - pairwise_prob[i][j];
+				pairwise_prob[i * nr_class + j] = temp_pairwise_prob[k];
+				pairwise_prob[j * nr_class + i] = 1
+						- pairwise_prob[i * nr_class + j];
 				k++;
 			}
 		free(temp_pairwise_prob);
 		cudaFree(d_dec_values);
 		cudaFree(d_pairwise_prob);
-		multiclass_probability(nr_class, pairwise_prob, prob_estimates);
+		multiclass_probability_gpu(nr_class, pairwise_prob, prob_estimates);
 
 		int prob_max_idx = 0;
 		for (i = 1; i < nr_class; i++)
 			if (prob_estimates[i] > prob_estimates[prob_max_idx])
 				prob_max_idx = i;
-		for (i = 0; i < nr_class; i++)
-			free(pairwise_prob[i]);
+//		for (i = 0; i < nr_class; i++)
+//			free(pairwise_prob[i]);
 		free(pairwise_prob);
 		return model->label[prob_max_idx];
 	} else
@@ -2853,7 +2949,7 @@ svm_model *svm_load_model(const char *model_file_name) {
 	}
 	setlocale(LC_ALL, "C");
 
-	// read parameters
+// read parameters
 
 	svm_model *model = Malloc(svm_model, 1);
 	model->rho = NULL;
@@ -2863,7 +2959,7 @@ svm_model *svm_load_model(const char *model_file_name) {
 	model->label = NULL;
 	model->nSV = NULL;
 
-	// read header
+// read header
 	if (!read_model_header(fp, model)) {
 		fprintf(stderr, "ERROR: fscanf failed to read model\n");
 		setlocale(LC_ALL, old_locale);
@@ -2875,7 +2971,7 @@ svm_model *svm_load_model(const char *model_file_name) {
 		return NULL;
 	}
 
-	// read sv_coef and SV
+// read sv_coef and SV
 
 	int elements = 0;
 	long pos = ftell(fp);
@@ -2993,14 +3089,14 @@ void svm_destroy_param(svm_parameter *param) {
 
 const char *svm_check_parameter(const svm_problem *prob,
 		const svm_parameter *param) {
-	// svm_type
+// svm_type
 
 	int svm_type = param->svm_type;
 	if (svm_type != C_SVC && svm_type != NU_SVC && svm_type != ONE_CLASS
 			&& svm_type != EPSILON_SVR && svm_type != NU_SVR)
 		return "unknown svm type";
 
-	// kernel_type, degree
+// kernel_type, degree
 
 	int kernel_type = param->kernel_type;
 	if (kernel_type != LINEAR && kernel_type != POLY && kernel_type != RBF
@@ -3013,7 +3109,7 @@ const char *svm_check_parameter(const svm_problem *prob,
 	if (param->degree < 0)
 		return "degree of polynomial kernel < 0";
 
-	// cache_size,eps,C,nu,p,shrinking
+// cache_size,eps,C,nu,p,shrinking
 
 	if (param->cache_size <= 0)
 		return "cache_size <= 0";
@@ -3042,7 +3138,7 @@ const char *svm_check_parameter(const svm_problem *prob,
 	if (param->probability == 1 && svm_type == ONE_CLASS)
 		return "one-class SVM probability output not supported yet";
 
-	// check whether nu-svc is feasible
+// check whether nu-svc is feasible
 
 	if (svm_type == NU_SVC) {
 		int l = prob->l;
