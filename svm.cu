@@ -1818,19 +1818,49 @@ __global__ void kernel_update_pQp(double *pQp, double *Qp, double *Q, double *p,
 		*pQp = sum;
 	}
 }
+__global__ void kernel_calculate_max_error(double *pQp, double *Qp,
+		double *max_error) {
+	extern __shared__ double error[];
+	error[threadIdx.x] = fabs(Qp[threadIdx.x] - *pQp);
+	__syncthreads();
+	if (0 == threadIdx.x) {
+		double max = 0;
+		for (int i = 0; i < blockDim.x; i++)
+			if (error[i] > max)
+				max = error[i];
+		*max_error = max;
+	}
+}
+__global__ void kernel_update_pQp3(double diff, double *Qp, double *Q,
+		double *p, int t, int k) {
+	int j = threadIdx.x;
+	Qp[j] = (Qp[j] + diff * Q[t * k + j]) / (1 + diff);
+	p[j] /= (1 + diff);
+}
+__global__ void kernel_update_pQp2(double *pQp, double *Qp, double *Q,
+		double *p, int k) {
+	for (int t = 0; t < k; t++) {
+		double diff = (-Qp[t] + *pQp) / Q[t * k + t];
+		p[t] += diff;
+		*pQp = (*pQp + diff * (diff * Q[t * k + t] + 2 * Qp[t])) / (1 + diff)
+				/ (1 + diff);
+		kernel_update_pQp3<<<1, k>>>(diff, Qp, Q, p, t, k);
+		cudaDeviceSynchronize();
+	}
+}
 static void multiclass_probability_gpu(int k, double *r, double *p) {
-	int t, j;
 	int iter = 0, max_iter = max(100, k);
 	double *Q = Malloc(double, k * k);
 	double *Qp = Malloc(double, k);
-	double pQp, eps = 0.005 / k;
+	double eps = 0.005 / k;
 
-	double *d_r, *d_Q, *d_p, *d_Qp, *d_pQp;
+	double *d_r, *d_Q, *d_p, *d_Qp, *d_pQp, *d_max_error;
 	cudaMalloc((void**) &d_r, sizeof(double) * k * k);
 	cudaMalloc((void**) &d_Q, sizeof(double) * k * k);
 	cudaMalloc((void**) &d_p, sizeof(double) * k);
 	cudaMalloc((void**) &d_Qp, sizeof(double) * k);
 	cudaMalloc((void**) &d_pQp, sizeof(double));
+	cudaMalloc((void**) &d_max_error, sizeof(double));
 	cudaMemcpy(d_r, r, sizeof(double) * k * k, cudaMemcpyHostToDevice);
 	dim3 threadPerBlock(BLOCK_SIZE, BLOCK_SIZE);
 	dim3 numBlocks((k + threadPerBlock.x - 1) / threadPerBlock.x,
@@ -1843,30 +1873,16 @@ static void multiclass_probability_gpu(int k, double *r, double *p) {
 	for (iter = 0; iter < max_iter; iter++) {
 		// stopping condition, recalculate QP,pQP for numerical accuracy
 		kernel_update_pQp<<<1, k>>>(d_pQp, d_Qp, d_Q, d_p, k);
-		cudaMemcpy(Qp, d_Qp, sizeof(double) * k, cudaMemcpyDeviceToHost);
-		cudaMemcpy(&pQp, d_pQp, sizeof(double) * 1, cudaMemcpyDeviceToHost);
 		double max_error = 0;
-		for (t = 0; t < k; t++) {
-			double error = fabs(Qp[t] - pQp);
-			if (error > max_error)
-				max_error = error;
-		}
+		kernel_calculate_max_error<<<1, k, sizeof(double) * k>>>(d_pQp, d_Qp,
+				d_max_error);
+		cudaMemcpy(&max_error, d_max_error, sizeof(double),
+				cudaMemcpyDeviceToHost);
 		if (max_error < eps)
 			break;
-
-		for (t = 0; t < k; t++) {
-			double diff = (-Qp[t] + pQp) / Q[t * k + t];
-			p[t] += diff;
-			pQp = (pQp + diff * (diff * Q[t * k + t] + 2 * Qp[t])) / (1 + diff)
-					/ (1 + diff);
-			for (j = 0; j < k; j++) {
-				Qp[j] = (Qp[j] + diff * Q[t * k + j]) / (1 + diff);
-				p[j] /= (1 + diff);
-			}
-		}
-		cudaMemcpy(d_p, p, sizeof(double) * k, cudaMemcpyHostToDevice);
-		cudaMemcpy(d_Qp, Qp, sizeof(double) * k, cudaMemcpyHostToDevice);
+		kernel_update_pQp2<<<1, 1>>>(d_pQp, d_Qp, d_Q, d_p, k);
 	}
+	cudaMemcpy(p, d_p, sizeof(double) * k, cudaMemcpyDeviceToHost);
 	if (iter >= max_iter)
 		info("Exceeds max_iter in multiclass_prob\n");
 	free(Q);
@@ -1875,6 +1891,7 @@ static void multiclass_probability_gpu(int k, double *r, double *p) {
 	cudaFree(d_r);
 	cudaFree(d_Qp);
 	cudaFree(d_pQp);
+	cudaFree(d_max_error);
 }
 
 // Cross-validation decision values for probability estimates

@@ -7,6 +7,7 @@
 #include <time.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
+#include "cuda_profiler_api.h"
 #define Malloc(type, n) (type *)malloc((n)*sizeof(type))
 int print_null(const char *s, ...) {
 	return 0;
@@ -113,6 +114,7 @@ void predict(FILE *input, FILE *output) {
 	}
 	//
 	while (readline(input) != NULL) {
+//		cudaProfilerStart();
 		int i = 0;
 		double target_label, predict_label;
 		char *idx, *val, *label, *endptr;
@@ -185,6 +187,8 @@ void predict(FILE *input, FILE *output) {
 		sumtt += target_label * target_label;
 		sumpt += predict_label * target_label;
 		++total;
+//		cudaProfilerStop();
+//		if (total == 50) break;
 	}
 
 	//CUDA
