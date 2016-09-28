@@ -188,7 +188,7 @@ void predict(FILE *input, FILE *output) {
 		sumpt += predict_label * target_label;
 		++total;
 //		cudaProfilerStop();
-//		if (total == 50) break;
+//		if (total == 500) break;
 	}
 
 	//CUDA

@@ -15,7 +15,7 @@
 #include <thrust/inner_product.h>
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
-
+#include "cublas_v2.h"
 int libsvm_version = LIBSVM_VERSION;
 typedef float Qfloat;
 typedef signed char schar;
@@ -1848,6 +1848,30 @@ __global__ void kernel_update_pQp2(double *pQp, double *Qp, double *Q,
 		cudaDeviceSynchronize();
 	}
 }
+
+__global__ void kernel_inverse_Q(double *a_i, double *c_o, int n) {
+	int *pivot = (int *) malloc(n * sizeof(int));
+	int *info = (int *) malloc(sizeof(int));
+	int batch;
+	cublasHandle_t hdl;
+	cublasStatus_t status = cublasCreate_v2(&hdl);
+	info[0] = 0;
+	batch = 1;
+	double **a = (double **) malloc(sizeof(double *));
+	*a = a_i;
+	const double **aconst = (const double **) a;
+	double **c = (double **) malloc(sizeof(double *));
+	*c = c_o;
+	status = cublasDgetrfBatched(hdl, n, a, n, pivot, info, batch);
+	__syncthreads();
+	status = cublasDgetriBatched(hdl, n, aconst, n, pivot, c, n, info, batch);
+	__syncthreads();
+	cublasDestroy_v2(hdl);
+	free(a);
+	free(c);
+	free(pivot);
+	free(info);
+}
 static void multiclass_probability_gpu(int k, double *r, double *p) {
 	int iter = 0, max_iter = max(100, k);
 	double *Q = Malloc(double, k * k);
@@ -1883,6 +1907,9 @@ static void multiclass_probability_gpu(int k, double *r, double *p) {
 		kernel_update_pQp2<<<1, 1>>>(d_pQp, d_Qp, d_Q, d_p, k);
 	}
 	cudaMemcpy(p, d_p, sizeof(double) * k, cudaMemcpyDeviceToHost);
+	double *d_IQ;
+	cudaMalloc((void**) &d_IQ, sizeof(double) * k * k);
+	kernel_inverse_Q<<<1, 1>>>(d_Q, d_IQ, k);
 	if (iter >= max_iter)
 		info("Exceeds max_iter in multiclass_prob\n");
 	free(Q);
