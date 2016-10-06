@@ -10,6 +10,8 @@
 #include "cuda_profiler_api.h"
 #define Malloc(type, n) (type *)malloc((n)*sizeof(type))
 extern clock_t multi_class_time;
+extern clock_t predict_values_time;
+
 int print_null(const char *s, ...) {
 	return 0;
 }
@@ -79,10 +81,11 @@ void predict(FILE *input, FILE *output) {
 
 	//CUDA
 	int l = model->l;
-	int *d_nSV, *d_start;
+	int *d_nSV, *d_start,*d_SV_start;
 	double *d_probA, *d_probB, *d_sv_coef, *temp_sv_coef, *d_rho;
 	int *start = Malloc(int, nr_class);
 	int cnr2 = nr_class * (nr_class - 1) / 2;
+	svm_node* d_x_space, d_x;
 	if (GPU) {
 		start[0] = 0;
 		for (int i = 1; i < nr_class; i++)
@@ -94,6 +97,8 @@ void predict(FILE *input, FILE *output) {
 		cudaMalloc((void**) &d_rho,
 				sizeof(double) * nr_class * (nr_class - 1) / 2);
 		cudaMalloc((void**) &d_start, sizeof(int) * nr_class);
+		cudaMalloc((void**) &d_x_space, sizeof(svm_node) * model->elements);
+		cudaMalloc((void**) &d_SV_start,sizeof(int)*l);
 		temp_sv_coef = Malloc(double, nr_class * l);
 		cudaMemcpy(d_probA, model->probA, sizeof(double) * cnr2,
 				cudaMemcpyHostToDevice);
@@ -110,6 +115,8 @@ void predict(FILE *input, FILE *output) {
 				cudaMemcpyHostToDevice);
 		cudaMemcpy(d_start, start, sizeof(int) * nr_class,
 				cudaMemcpyHostToDevice);
+		cudaMemcpy(d_x_space,model->x_space,sizeof(svm_node)*model->elements,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_SV_start, model->SV_start, sizeof(int)*l, cudaMemcpyHostToDevice);
 	}
 	//
 	while (readline(input) != NULL) {
@@ -162,7 +169,7 @@ void predict(FILE *input, FILE *output) {
 			if (GPU) {
 				predict_label = svm_predict_probability_gpu(model, x,
 						prob_estimates, d_probA, d_probB, d_sv_coef, d_nSV,
-						d_rho, d_start);
+						d_rho, d_start,d_x_space,d_SV_start,max_nr_attr);
 			} else {
 				predict_label = svm_predict_probability(model, x,
 						prob_estimates);
@@ -200,6 +207,8 @@ void predict(FILE *input, FILE *output) {
 		cudaFree(d_nSV);
 		cudaFree(d_rho);
 		cudaFree(d_start);
+		cudaFree(d_x_space);
+		cudaFree(d_SV_start);
 	}
 	//
 	if (svm_type == NU_SVR || svm_type == EPSILON_SVR) {
@@ -284,6 +293,8 @@ int main(int argc, char **argv) {
 	printf("prediction time:%.2f\n", ((double) (end - start)) / CLOCKS_PER_SEC);
 	printf("multi-class time:%.2f\n",
 			((double) (multi_class_time)) / CLOCKS_PER_SEC);
+	printf("predict_values time:%.2f\n",
+			((double) (predict_values_time)) / CLOCKS_PER_SEC);
 	svm_free_and_destroy_model(&model);
 	free(x);
 	free(line);

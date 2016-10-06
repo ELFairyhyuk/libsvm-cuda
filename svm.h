@@ -71,6 +71,9 @@ struct svm_model {
 	/* XXX */
 	int free_sv; /* 1 if svm_model is created by svm_load_model*/
 	/* 0 if svm_model is created by svm_train */
+	int elements;
+	int *SV_start;
+	svm_node *x_space;
 };
 
 struct svm_model *svm_train(const struct svm_problem *prob,
@@ -92,14 +95,14 @@ double svm_predict_values(const struct svm_model *model,
 		const struct svm_node *x, double* dec_values);
 double svm_predict_values_gpu(const struct svm_model *model,
 		const struct svm_node *x, double* d_dec_values, double *d_sv_coef,
-		int *d_nSV, double *d_rho, int *d_start);
+		int *d_nSV, double *d_rho, int *d_start, svm_node* d_x_space, int *d_SV_start);
 double svm_predict(const struct svm_model *model, const struct svm_node *x);
 double svm_predict_probability(const struct svm_model *model,
 		const struct svm_node *x, double* prob_estimates);
 double svm_predict_probability_gpu(const struct svm_model *model,
 		const struct svm_node *x, double* prob_estimates, double *d_probA,
 		double *d_probB, double *d_sv_coef, int *d_nSV, double *d_rho,
-		int *d_start);
+		int *d_start,svm_node* d_x_space, int *d_SV_start, int max_nr_attr);
 
 void svm_free_model_content(struct svm_model *model_ptr);
 void svm_free_and_destroy_model(struct svm_model **model_ptr_ptr);

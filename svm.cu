@@ -14,7 +14,8 @@
 #include "device_launch_parameters.h"
 #include "cublas_v2.h"
 #include "cuda_profiler_api.h"
-extern clock_t multi_class_time = 0;
+clock_t multi_class_time = 0;
+clock_t predict_values_time = 0;
 int libsvm_version = LIBSVM_VERSION;
 typedef float Qfloat;
 typedef signed char schar;
@@ -49,6 +50,16 @@ static inline void clone(T *&dst, S *src, int n) {
 }
 
 static inline double powi(double base, int times) {
+	double tmp = base, ret = 1.0;
+
+	for (int t = times; t > 0; t /= 2) {
+		if (t % 2 == 1)
+			ret *= tmp;
+		tmp = tmp * tmp;
+	}
+	return ret;
+}
+static inline __device__ double device_powi(double base, int times) {
 	double tmp = base, ret = 1.0;
 
 	for (int t = times; t > 0; t /= 2) {
@@ -386,7 +397,68 @@ double Kernel::k_function(const svm_node *x, const svm_node *y,
 		return 0;  // Unreachable
 	}
 }
+__device__ double device_dot(const svm_node *px, const svm_node *py) {
+	double sum = 0;
+	while (px->index != -1 && py->index != -1) {
+		if (px->index == py->index) {
+			sum += px->value * py->value;
+			++px;
+			++py;
+		} else {
+			if (px->index > py->index)
+				++py;
+			else
+				++px;
+		}
+	}
+	return sum;
+}
+__device__ double device_k_function(const svm_node *x, const svm_node *y,
+		const svm_parameter &param) {
+	switch (param.kernel_type) {
+	case LINEAR:
+		return device_dot(x, y);
+	case POLY:
+		return device_powi(param.gamma * device_dot(x, y) + param.coef0, param.degree);
+	case RBF: {
+		double sum = 0;
+		while (x->index != -1 && y->index != -1) {
+			if (x->index == y->index) {
+				double d = x->value - y->value;
+				sum += d * d;
+				++x;
+				++y;
+			} else {
+				if (x->index > y->index) {
+					sum += y->value * y->value;
+					++y;
+				} else {
+					sum += x->value * x->value;
+					++x;
+				}
+			}
+		}
 
+		while (x->index != -1) {
+			sum += x->value * x->value;
+			++x;
+		}
+
+		while (y->index != -1) {
+			sum += y->value * y->value;
+			++y;
+		}
+
+		return exp(-param.gamma * sum);
+	}
+	case SIGMOID:
+		return tanh(param.gamma * device_dot(x, y) + param.coef0);
+	case PRECOMPUTED:  //x: test (validation), y: SV
+		return x[(int) (y->value)].value;
+	default:
+		return 0;  // Unreachable
+	}
+}
 // An SMO algorithm in Fan et al., JMLR 6(2005), p. 1889--1918
 // Solves:
 //
@@ -2590,9 +2662,17 @@ double svm_predict_values(const svm_model *model, const svm_node *x,
 		return model->label[vote_max_idx];
 	}
 }
+
+__global__ void kernel_calculate_kvalue(svm_node *x, svm_node *x_space,
+		int *SV_start, svm_parameter param, double *kvalue, int l) {
+	int tid = blockDim.x * blockIdx.x + threadIdx.x;
+	if (tid < l) {
+		kvalue[tid] = device_k_function(x, x_space + SV_start[tid], param);
+	}
+}
 double svm_predict_values_gpu(const svm_model *model, const svm_node *x,
 		double *d_dec_values, double *d_sv_coef, int *d_nSV, double *d_rho,
-		int *d_start) {
+		int *d_start, svm_node* d_x_space, int *d_SV_start, int max_nr_attr) {
 	int i;
 	if (model->param.svm_type == ONE_CLASS
 			|| model->param.svm_type == EPSILON_SVR
@@ -2613,9 +2693,9 @@ double svm_predict_values_gpu(const svm_model *model, const svm_node *x,
 		int nr_class = model->nr_class;
 		int l = model->l;
 
-		double *kvalue = Malloc(double, l);
-		for (i = 0; i < l; i++)
-			kvalue[i] = Kernel::k_function(x, model->SV[i], model->param);
+		// double *kvalue = Malloc(double, l);
+		// for (i = 0; i < l; i++)
+		// 	kvalue[i] = Kernel::k_function(x, model->SV[i], model->param);
 
 		int *vote = Malloc(int, nr_class);
 		for (i = 0; i < nr_class; i++)
@@ -2623,12 +2703,19 @@ double svm_predict_values_gpu(const svm_model *model, const svm_node *x,
 
 		int *d_vote;
 		double *d_kvalue;
+		svm_node *d_x;
 		cudaMalloc((void**) &d_kvalue, sizeof(double) * l);
 		cudaMalloc((void**) &d_vote, sizeof(int) * nr_class);
-		cudaMemcpy(d_kvalue, kvalue, sizeof(double) * l,
-				cudaMemcpyHostToDevice);
+		cudaMalloc((void**) &d_x, sizeof(svm_node) * max_nr_attr);
+		// cudaMemcpy(d_kvalue, kvalue, sizeof(double) * l,
+		// 		cudaMemcpyHostToDevice);
 		cudaMemcpy(d_vote, vote, sizeof(int) * nr_class,
 				cudaMemcpyHostToDevice);
+		cudaMemcpy(d_x, x, sizeof(svm_node) * max_nr_attr,
+						cudaMemcpyHostToDevice);
+		int blockSize = 512;
+		kernel_calculate_kvalue<<<(l + blockSize - 1) / blockSize, blockSize>>>(d_x, d_x_space,
+				d_SV_start, model->param, d_kvalue, l);
 		dim3 threadPerBlock(BLOCK_SIZE, BLOCK_SIZE);
 		dim3 numBlocks((nr_class + threadPerBlock.x - 1) / threadPerBlock.x,
 				(nr_class + threadPerBlock.y - 1) / threadPerBlock.y);
@@ -2639,12 +2726,12 @@ double svm_predict_values_gpu(const svm_model *model, const svm_node *x,
 
 		cudaFree(d_kvalue);
 		cudaFree(d_vote);
+		cudaFree(d_x);
 		int vote_max_idx = 0;
 		for (i = 1; i < nr_class; i++)
 			if (vote[i] > vote[vote_max_idx])
 				vote_max_idx = i;
 
-		free(kvalue);
 		free(vote);
 		return model->label[vote_max_idx];
 	}
@@ -2725,16 +2812,21 @@ double svm_predict_probability(const svm_model *model, const svm_node *x,
 }
 double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
 		double *prob_estimates, double *d_probA, double *d_probB,
-		double *d_sv_coef, int *d_nSV, double *d_rho, int *d_start) {
+		double *d_sv_coef, int *d_nSV, double *d_rho, int *d_start,
+		svm_node* d_x_space, int *d_SV_start, int max_nr_attr) {
 	if ((model->param.svm_type == C_SVC || model->param.svm_type == NU_SVC)
 			&& model->probA != NULL && model->probB != NULL) {
 		int i;
 		int nr_class = model->nr_class;
 		int cnr2 = nr_class * (nr_class - 1) / 2;
 		double *d_dec_values;
+		clock_t start, end;
+		start = clock();
 		cudaMalloc((void**) &d_dec_values, sizeof(double) * cnr2);
 		svm_predict_values_gpu(model, x, d_dec_values, d_sv_coef, d_nSV, d_rho,
-				d_start);
+				d_start, d_x_space, d_SV_start, max_nr_attr);
+		end = clock();
+		predict_values_time += end - start;
 
 //		double **pairwise_prob = Malloc(double *, nr_class);
 //		for (i = 0; i < nr_class; i++)
@@ -2764,7 +2856,6 @@ double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
 		free(temp_pairwise_prob);
 		cudaFree(d_dec_values);
 		cudaFree(d_pairwise_prob);
-		clock_t start, end;
 		start = clock();
 		multiclass_probability_gpu(nr_class, pairwise_prob, prob_estimates);
 		end = clock();
@@ -3060,12 +3151,14 @@ svm_model *svm_load_model(const char *model_file_name) {
 	svm_node *x_space = NULL;
 	if (l > 0)
 		x_space = Malloc(svm_node, elements);
-
+	model->elements = elements;
+	model->SV_start = Malloc(int, l);
+	model->x_space = x_space;
 	int j = 0;
 	for (i = 0; i < l; i++) {
 		readline(fp);
 		model->SV[i] = &x_space[j];
-
+		model->SV_start[i] = j;
 		p = strtok(line, " \t");
 		model->sv_coef[0][i] = strtod(p, &endptr);
 		for (int k = 1; k < m; k++) {
