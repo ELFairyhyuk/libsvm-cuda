@@ -8,7 +8,13 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "cuda_profiler_api.h"
+#include "cublas_v2.h"
 #define Malloc(type, n) (type *)malloc((n)*sizeof(type))
+extern clock_t multi_class_time;
+double svm_predict_probability_gpu(const struct svm_model *model,
+		const struct svm_node *x, double* prob_estimates, double *d_probA,
+		double *d_probB, double *d_sv_coef, int *d_nSV, double *d_rho,
+		int *d_start,cublasHandle_t hdl);
 int print_null(const char *s, ...) {
 	return 0;
 }
@@ -81,7 +87,7 @@ void predict(FILE *input, FILE *output) {
 	int *d_nSV, *d_start;
 	double *d_probA, *d_probB, *d_sv_coef, *temp_sv_coef, *d_rho;
 	int *start = Malloc(int, nr_class);
-
+	cublasHandle_t hdl;
 	int cnr2 = nr_class * (nr_class - 1) / 2;
 	if (GPU) {
 		start[0] = 0;
@@ -111,10 +117,11 @@ void predict(FILE *input, FILE *output) {
 		cudaMemcpy(d_start, start, sizeof(int) * nr_class,
 				cudaMemcpyHostToDevice);
 
+//		cublasStatus_t status = cublasCreate(&hdl);
 	}
 	//
 	while (readline(input) != NULL) {
-//		cudaProfilerStart();
+		cudaProfilerStart();
 		int i = 0;
 		double target_label, predict_label;
 		char *idx, *val, *label, *endptr;
@@ -163,7 +170,7 @@ void predict(FILE *input, FILE *output) {
 			if (GPU) {
 				predict_label = svm_predict_probability_gpu(model, x,
 						prob_estimates, d_probA, d_probB, d_sv_coef, d_nSV,
-						d_rho, d_start);
+						d_rho, d_start, hdl);
 			} else {
 				predict_label = svm_predict_probability(model, x,
 						prob_estimates);
@@ -187,7 +194,7 @@ void predict(FILE *input, FILE *output) {
 		sumtt += target_label * target_label;
 		sumpt += predict_label * target_label;
 		++total;
-//		cudaProfilerStop();
+		cudaProfilerStop();
 //		if (total == 500) break;
 	}
 
@@ -201,6 +208,7 @@ void predict(FILE *input, FILE *output) {
 		cudaFree(d_nSV);
 		cudaFree(d_rho);
 		cudaFree(d_start);
+//		cublasDestroy(hdl);
 	}
 	//
 	if (svm_type == NU_SVR || svm_type == EPSILON_SVR) {
@@ -282,7 +290,9 @@ int main(int argc, char **argv) {
 	start = clock();
 	predict(input, output);
 	end = clock();
-	printf("%.2f", ((double) (end - start)) / CLOCKS_PER_SEC);
+	printf("prediction time:%.2f\n", ((double) (end - start)) / CLOCKS_PER_SEC);
+	printf("multi-class time:%.2f\n",
+			((double) (multi_class_time)) / CLOCKS_PER_SEC);
 	svm_free_and_destroy_model(&model);
 	free(x);
 	free(line);

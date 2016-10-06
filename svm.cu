@@ -12,10 +12,9 @@
 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
-#include <thrust/inner_product.h>
-#include <thrust/device_ptr.h>
-#include <thrust/execution_policy.h>
 #include "cublas_v2.h"
+#include "cuda_profiler_api.h"
+extern clock_t multi_class_time = 0;
 int libsvm_version = LIBSVM_VERSION;
 typedef float Qfloat;
 typedef signed char schar;
@@ -1849,12 +1848,13 @@ __global__ void kernel_update_pQp2(double *pQp, double *Qp, double *Q,
 	}
 }
 
-__global__ void kernel_inverse_Q(double *a_i, double *c_o, int n) {
+__global__ void kernel_inverse_Q(double *a_i, double *c_o, int n,
+		cublasHandle_t hdl1) {
 	int *pivot = (int *) malloc(n * sizeof(int));
 	int *info = (int *) malloc(sizeof(int));
 	int batch;
 	cublasHandle_t hdl;
-	cublasStatus_t status = cublasCreate_v2(&hdl);
+	cublasStatus_t staticus = cublasCreate_v2(&hdl);
 	info[0] = 0;
 	batch = 1;
 	double **a = (double **) malloc(sizeof(double *));
@@ -1862,9 +1862,9 @@ __global__ void kernel_inverse_Q(double *a_i, double *c_o, int n) {
 	const double **aconst = (const double **) a;
 	double **c = (double **) malloc(sizeof(double *));
 	*c = c_o;
-	status = cublasDgetrfBatched(hdl, n, a, n, pivot, info, batch);
+	cublasDgetrfBatched(hdl, n, a, n, pivot, info, batch);
 	__syncthreads();
-	status = cublasDgetriBatched(hdl, n, aconst, n, pivot, c, n, info, batch);
+	cublasDgetriBatched(hdl, n, aconst, n, pivot, c, n, info, batch);
 	__syncthreads();
 	cublasDestroy_v2(hdl);
 	free(a);
@@ -1872,7 +1872,26 @@ __global__ void kernel_inverse_Q(double *a_i, double *c_o, int n) {
 	free(pivot);
 	free(info);
 }
-static void multiclass_probability_gpu(int k, double *r, double *p) {
+__global__ void kernel_calculate_p(double *IQ, double *p, int k) {
+	extern __shared__ double sum[];
+	double *etQe = sum + k;
+	*etQe = 0;
+	int tid = threadIdx.x;
+	sum[tid] = 0;
+	for (int i = 0; i < k; i++)
+		sum[tid] += IQ[tid * k + i];
+	__syncthreads();
+	if (0 == threadIdx.x) {
+		*etQe = 0;
+		for (int i = 0; i < k; i++)
+			*etQe += sum[i];
+	}
+	__syncthreads();
+	p[tid] = sum[tid] / *etQe;
+}
+static void multiclass_probability_gpu(int k, double *r, double *p,
+		cublasHandle_t hdl) {
+	cudaProfilerStart();
 	int iter = 0, max_iter = max(100, k);
 	double *Q = Malloc(double, k * k);
 	double *Qp = Malloc(double, k);
@@ -1882,43 +1901,46 @@ static void multiclass_probability_gpu(int k, double *r, double *p) {
 	cudaMalloc((void**) &d_r, sizeof(double) * k * k);
 	cudaMalloc((void**) &d_Q, sizeof(double) * k * k);
 	cudaMalloc((void**) &d_p, sizeof(double) * k);
-	cudaMalloc((void**) &d_Qp, sizeof(double) * k);
-	cudaMalloc((void**) &d_pQp, sizeof(double));
-	cudaMalloc((void**) &d_max_error, sizeof(double));
+//	cudaMalloc((void**) &d_Qp, sizeof(double) * k);
+//	cudaMalloc((void**) &d_pQp, sizeof(double));
+//	cudaMalloc((void**) &d_max_error, sizeof(double));
 	cudaMemcpy(d_r, r, sizeof(double) * k * k, cudaMemcpyHostToDevice);
 	dim3 threadPerBlock(BLOCK_SIZE, BLOCK_SIZE);
 	dim3 numBlocks((k + threadPerBlock.x - 1) / threadPerBlock.x,
 			(k + threadPerBlock.y - 1) / threadPerBlock.y);
 	kernel_calculate_Q<<<numBlocks, threadPerBlock>>>(k, d_Q, d_r);
 	kernel_calculate_Q_diag<<<k, k, sizeof(double) * k>>>(k, d_Q, d_r);
-	kernel_init_p<<<1, k>>>(d_p, k);
-	cudaMemcpy(Q, d_Q, sizeof(double) * k * k, cudaMemcpyDeviceToHost);
-	cudaMemcpy(p, d_p, sizeof(double) * k, cudaMemcpyDeviceToHost);
-	for (iter = 0; iter < max_iter; iter++) {
-		// stopping condition, recalculate QP,pQP for numerical accuracy
-		kernel_update_pQp<<<1, k>>>(d_pQp, d_Qp, d_Q, d_p, k);
-		double max_error = 0;
-		kernel_calculate_max_error<<<1, k, sizeof(double) * k>>>(d_pQp, d_Qp,
-				d_max_error);
-		cudaMemcpy(&max_error, d_max_error, sizeof(double),
-				cudaMemcpyDeviceToHost);
-		if (max_error < eps)
-			break;
-		kernel_update_pQp2<<<1, 1>>>(d_pQp, d_Qp, d_Q, d_p, k);
-	}
-	cudaMemcpy(p, d_p, sizeof(double) * k, cudaMemcpyDeviceToHost);
+//	kernel_init_p<<<1, k>>>(d_p, k);
+//	cudaMemcpy(Q, d_Q, sizeof(double) * k * k, cudaMemcpyDeviceToHost);
+//	cudaMemcpy(p, d_p, sizeof(double) * k, cudaMemcpyDeviceToHost);
+//	for (iter = 0; iter < max_iter; iter++) {
+//		// stopping condition, recalculate QP,pQP for numerical accuracy
+//		kernel_update_pQp<<<1, k>>>(d_pQp, d_Qp, d_Q, d_p, k);
+//		double max_error = 0;
+//		kernel_calculate_max_error<<<1, k, sizeof(double) * k>>>(d_pQp, d_Qp,
+//				d_max_error);
+//		cudaMemcpy(&max_error, d_max_error, sizeof(double),
+//				cudaMemcpyDeviceToHost);
+//		if (max_error < eps)
+//			break;
+//		kernel_update_pQp2<<<1, 1>>>(d_pQp, d_Qp, d_Q, d_p, k);
+//	}
+//	cudaMemcpy(p, d_p, sizeof(double) * k, cudaMemcpyDeviceToHost);
 	double *d_IQ;
 	cudaMalloc((void**) &d_IQ, sizeof(double) * k * k);
-	kernel_inverse_Q<<<1, 1>>>(d_Q, d_IQ, k);
+	kernel_inverse_Q<<<1, 1>>>(d_Q, d_IQ, k, hdl);
+
 	if (iter >= max_iter)
 		info("Exceeds max_iter in multiclass_prob\n");
 	free(Q);
-	free(Qp);
+//	free(Qp);
 	cudaFree(d_Q);
 	cudaFree(d_r);
-	cudaFree(d_Qp);
-	cudaFree(d_pQp);
-	cudaFree(d_max_error);
+	cudaFree(d_IQ);
+//	cudaFree(d_Qp);
+//	cudaFree(d_pQp);
+//	cudaFree(d_max_error);
+	cudaProfilerStop();
 }
 
 // Cross-validation decision values for probability estimates
@@ -2735,7 +2757,8 @@ double svm_predict_probability(const svm_model *model, const svm_node *x,
 }
 double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
 		double *prob_estimates, double *d_probA, double *d_probB,
-		double *d_sv_coef, int *d_nSV, double *d_rho, int *d_start) {
+		double *d_sv_coef, int *d_nSV, double *d_rho, int *d_start,
+		cublasHandle_t hdl) {
 	if ((model->param.svm_type == C_SVC || model->param.svm_type == NU_SVC)
 			&& model->probA != NULL && model->probB != NULL) {
 		int i;
@@ -2767,13 +2790,20 @@ double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
 				pairwise_prob[i * nr_class + j] = temp_pairwise_prob[k];
 				pairwise_prob[j * nr_class + i] = 1
 						- pairwise_prob[i * nr_class + j];
+//				pairwise_prob[i][j] = temp_pairwise_prob[k];
+//				pairwise_prob[j][i] = 1 - pairwise_prob[i][j];
 				k++;
 			}
 		free(temp_pairwise_prob);
 		cudaFree(d_dec_values);
 		cudaFree(d_pairwise_prob);
-		multiclass_probability_gpu(nr_class, pairwise_prob, prob_estimates);
-
+		clock_t start, end;
+		start = clock();
+		multiclass_probability_gpu(nr_class, pairwise_prob, prob_estimates,
+				hdl);
+		end = clock();
+		multi_class_time += end - start;
+//		printf("multi-class time:%.8f\n", ((double) (multi_class_time)) / CLOCKS_PER_SEC);
 		int prob_max_idx = 0;
 		for (i = 1; i < nr_class; i++)
 			if (prob_estimates[i] > prob_estimates[prob_max_idx])

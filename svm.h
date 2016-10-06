@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 extern int libsvm_version;
-
+//#include "cublas_v2.h"
 struct svm_node {
 	int index;
 	double value;
@@ -97,10 +97,10 @@ double svm_predict_values_gpu(const struct svm_model *model,
 double svm_predict(const struct svm_model *model, const struct svm_node *x);
 double svm_predict_probability(const struct svm_model *model,
 		const struct svm_node *x, double* prob_estimates);
-double svm_predict_probability_gpu(const struct svm_model *model,
-		const struct svm_node *x, double* prob_estimates, double *d_probA,
-		double *d_probB, double *d_sv_coef, int *d_nSV, double *d_rho,
-		int *d_start);
+//double svm_predict_probability_gpu(const struct svm_model *model,
+//		const struct svm_node *x, double* prob_estimates, double *d_probA,
+//		double *d_probB, double *d_sv_coef, int *d_nSV, double *d_rho,
+//		int *d_start,cublasHandle_t hdl);
 
 void svm_free_model_content(struct svm_model *model_ptr);
 void svm_free_and_destroy_model(struct svm_model **model_ptr_ptr);
