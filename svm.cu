@@ -1848,8 +1848,7 @@ __global__ void kernel_update_pQp2(double *pQp, double *Qp, double *Q,
 	}
 }
 
-__global__ void kernel_inverse_Q(double *a_i, double *c_o, int n,
-		cublasHandle_t hdl1) {
+__global__ void kernel_inverse_Q(double *a_i, double *c_o, int n) {
 	int *pivot = (int *) malloc(n * sizeof(int));
 	int *info = (int *) malloc(sizeof(int));
 	int batch;
@@ -1889,57 +1888,26 @@ __global__ void kernel_calculate_p(double *IQ, double *p, int k) {
 	__syncthreads();
 	p[tid] = sum[tid] / *etQe;
 }
-static void multiclass_probability_gpu(int k, double *r, double *p,
-		cublasHandle_t hdl) {
+static void multiclass_probability_gpu(int k, double *r, double *p) {
 	cudaProfilerStart();
-	int iter = 0, max_iter = max(100, k);
-	double *Q = Malloc(double, k * k);
-	double *Qp = Malloc(double, k);
-	double eps = 0.005 / k;
-
-	double *d_r, *d_Q, *d_p, *d_Qp, *d_pQp, *d_max_error;
+	double *d_r, *d_Q, *d_p;
 	cudaMalloc((void**) &d_r, sizeof(double) * k * k);
 	cudaMalloc((void**) &d_Q, sizeof(double) * k * k);
 	cudaMalloc((void**) &d_p, sizeof(double) * k);
-//	cudaMalloc((void**) &d_Qp, sizeof(double) * k);
-//	cudaMalloc((void**) &d_pQp, sizeof(double));
-//	cudaMalloc((void**) &d_max_error, sizeof(double));
 	cudaMemcpy(d_r, r, sizeof(double) * k * k, cudaMemcpyHostToDevice);
 	dim3 threadPerBlock(BLOCK_SIZE, BLOCK_SIZE);
 	dim3 numBlocks((k + threadPerBlock.x - 1) / threadPerBlock.x,
 			(k + threadPerBlock.y - 1) / threadPerBlock.y);
 	kernel_calculate_Q<<<numBlocks, threadPerBlock>>>(k, d_Q, d_r);
 	kernel_calculate_Q_diag<<<k, k, sizeof(double) * k>>>(k, d_Q, d_r);
-//	kernel_init_p<<<1, k>>>(d_p, k);
-//	cudaMemcpy(Q, d_Q, sizeof(double) * k * k, cudaMemcpyDeviceToHost);
-//	cudaMemcpy(p, d_p, sizeof(double) * k, cudaMemcpyDeviceToHost);
-//	for (iter = 0; iter < max_iter; iter++) {
-//		// stopping condition, recalculate QP,pQP for numerical accuracy
-//		kernel_update_pQp<<<1, k>>>(d_pQp, d_Qp, d_Q, d_p, k);
-//		double max_error = 0;
-//		kernel_calculate_max_error<<<1, k, sizeof(double) * k>>>(d_pQp, d_Qp,
-//				d_max_error);
-//		cudaMemcpy(&max_error, d_max_error, sizeof(double),
-//				cudaMemcpyDeviceToHost);
-//		if (max_error < eps)
-//			break;
-//		kernel_update_pQp2<<<1, 1>>>(d_pQp, d_Qp, d_Q, d_p, k);
-//	}
-//	cudaMemcpy(p, d_p, sizeof(double) * k, cudaMemcpyDeviceToHost);
 	double *d_IQ;
 	cudaMalloc((void**) &d_IQ, sizeof(double) * k * k);
-	kernel_inverse_Q<<<1, 1>>>(d_Q, d_IQ, k, hdl);
-
-	if (iter >= max_iter)
-		info("Exceeds max_iter in multiclass_prob\n");
-	free(Q);
-//	free(Qp);
+	kernel_inverse_Q<<<1, 1>>>(d_Q, d_IQ, k);
+	kernel_calculate_p<<<1, k, sizeof(double) * (k + 1)>>>(d_IQ, d_p, k);
+	cudaMemcpy(p, d_p, sizeof(double) * k, cudaMemcpyDeviceToHost);
 	cudaFree(d_Q);
 	cudaFree(d_r);
 	cudaFree(d_IQ);
-//	cudaFree(d_Qp);
-//	cudaFree(d_pQp);
-//	cudaFree(d_max_error);
 	cudaProfilerStop();
 }
 
@@ -2757,8 +2725,7 @@ double svm_predict_probability(const svm_model *model, const svm_node *x,
 }
 double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
 		double *prob_estimates, double *d_probA, double *d_probB,
-		double *d_sv_coef, int *d_nSV, double *d_rho, int *d_start,
-		cublasHandle_t hdl) {
+		double *d_sv_coef, int *d_nSV, double *d_rho, int *d_start) {
 	if ((model->param.svm_type == C_SVC || model->param.svm_type == NU_SVC)
 			&& model->probA != NULL && model->probB != NULL) {
 		int i;
@@ -2799,8 +2766,7 @@ double svm_predict_probability_gpu(const svm_model *model, const svm_node *x,
 		cudaFree(d_pairwise_prob);
 		clock_t start, end;
 		start = clock();
-		multiclass_probability_gpu(nr_class, pairwise_prob, prob_estimates,
-				hdl);
+		multiclass_probability_gpu(nr_class, pairwise_prob, prob_estimates);
 		end = clock();
 		multi_class_time += end - start;
 //		printf("multi-class time:%.8f\n", ((double) (multi_class_time)) / CLOCKS_PER_SEC);
